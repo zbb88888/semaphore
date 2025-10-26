@@ -4,6 +4,7 @@ package runnerproxy
 // It provides methods to interact with the following manager APIs:
 // GET /api/v1/keepalive?node_id=<id> - 查询节点状态
 // POST /api/v1/keepalive - 注册节点
+// List /api/v1/releases - 获取发布列表
 // 请求体: {"node_id": "string", "cpu_arch": "string", "os_release": "string", "node_name": "string", "bin_proxy_version": "string"}
 // GET /api/v1/bins/:bin_name - 获取二进制文件信息
 // POST /api/v1/bins/:bin_name - 更新节点的二进制文件版本
@@ -38,6 +39,8 @@ type ProxyConfig struct {
 	HTTPClient      *http.Client
 
 	KeepAliveInterval time.Duration
+	// 待部署的服务列表：包含 bin 服务类型
+	releasesToDo []Release
 }
 
 // RunnerProxy manages communication with the manager
@@ -122,6 +125,30 @@ func (rp *RunnerProxy) RegisterNode() error {
 	}
 
 	return nil
+}
+
+type Release struct {
+	ID            string     `json:"id" bson:"_id,omitempty"`
+	ProjectID     string     `json:"projectId" bson:"projectId"`
+	ProjectName   string     `json:"projectName" bson:"projectName"`
+	ApplicationID string     `json:"applicationId" bson:"applicationId"`
+	Version       string     `json:"version" bson:"version"`
+	Environment   string     `json:"environment" bson:"environment"`
+	Strategy      string     `json:"strategy" bson:"strategy"`
+	Status        string     `json:"status" bson:"status"`
+	Description   string     `json:"description" bson:"description"`
+	Scheduler     string     `json:"scheduler" bson:"scheduler"`
+	GitlabPRURL   string     `json:"gitlabPrUrl" bson:"gitlabPrUrl"`
+	TarFileName   string     `json:"tarFileName" bson:"tarFileName"`
+	StartedAt     *time.Time `json:"startedAt,omitempty" bson:"startedAt,omitempty"`
+	CompletedAt   *time.Time `json:"completedAt,omitempty" bson:"completedAt,omitempty"`
+	CreatedAt     time.Time  `json:"createdAt" bson:"createdAt"`
+}
+
+type ReleaseResponse struct {
+	Code    int         `json:"code"`
+	Message string      `json:"message"`
+	Data    interface{} `json:"data,omitempty"`
 }
 
 // GetBinaryInfo retrieves binary file information via GET /api/v1/bins/:bin_name
@@ -220,6 +247,33 @@ func (rp *RunnerProxy) DownloadBinary(binFileName string) ([]byte, error) {
 	return body, nil
 }
 
+// ListReleases retrieves release list via GET /api/v1/releases
+func (rp *RunnerProxy) ListReleases() (*ReleaseResponse, error) {
+	url := fmt.Sprintf("%s/api/v1/releases", rp.config.ManagerURL)
+	resp, err := rp.config.HTTPClient.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list releases: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("list releases failed with status: %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var releaseResp ReleaseResponse
+	if err := json.Unmarshal(body, &releaseResp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal release response (body: %s): %w", string(body), err)
+	}
+
+	return &releaseResp, nil
+}
+
 // HealthCheck performs health check via GET /health
 func (rp *RunnerProxy) HealthCheck() error {
 	url := fmt.Sprintf("%s/health", rp.config.ManagerURL)
@@ -262,29 +316,95 @@ func NewProxyService() *RunnerProxy {
 func (rp *RunnerProxy) Run() {
 	fmt.Printf("Runner Proxy started. Manager URL: %s, Node: %s\n", rp.config.ManagerURL, rp.config.NodeName)
 
-	// todo:// 创建两个定时器：一个用于 keepalive，一个用于拉取 releases
+	// 创建两个定时器：一个用于 keepalive，一个用于拉取 releases
 	keepaliveTicker := time.NewTicker(rp.config.KeepAliveInterval)
+	releasesTicker := time.NewTicker(10 * time.Second) // 每10秒拉取一次 releases
 	defer keepaliveTicker.Stop()
+	defer releasesTicker.Stop()
 
-	for range keepaliveTicker.C {
-		// 每隔 KeepAliveInterval 调用 HealthCheck 方法
-		err := rp.HealthCheck()
-		if err != nil {
-			fmt.Printf("Health check failed: %v\n", err)
+	// 启动时立即拉取一次 releases
+	rp.fetchAndLogReleases()
+
+	for {
+		select {
+		case <-keepaliveTicker.C:
+			// 每隔 KeepAliveInterval 调用 HealthCheck 方法
+			err := rp.HealthCheck()
+			if err != nil {
+				fmt.Printf("Health check failed: %v\n", err)
+			}
+			if !rp.config.ManagerIsActive {
+				fmt.Println("Manager is not active. Skipping further checks.")
+				continue
+			}
+			// 调用 CheckNodeStatus 方法
+			err = rp.CheckNodeStatus()
+			if err != nil {
+				fmt.Printf("Node status check failed: %v\n", err)
+				// 如果节点状态检查失败，则调用 RegisterNode 方法注册节点
+				err = rp.RegisterNode()
+				if err != nil {
+					fmt.Printf("Node registration failed: %v\n", err)
+				}
+			}
+		case <-releasesTicker.C:
+			// 定期拉取 releases 列表
+			rp.fetchAndLogReleases()
 		}
-		if !rp.config.ManagerIsActive {
-			fmt.Println("Manager is not active. Skipping further checks.")
+	}
+}
+
+// fetchAndLogReleases 拉取并记录 releases 信息
+func (rp *RunnerProxy) fetchAndLogReleases() {
+	if !rp.config.ManagerIsActive {
+		fmt.Println("Manager is not active. Skipping releases fetch.")
+		return
+	}
+
+	releases, err := rp.ListReleases()
+	if err != nil {
+		fmt.Printf("Failed to fetch releases: %v\n", err)
+		return
+	}
+
+	// 解析 Data 字段为 Release 数组
+	if releases.Data == nil {
+		fmt.Println("No releases data returned from manager")
+		return
+	}
+
+	// 尝试将 Data 转换为 Release 数组
+	dataBytes, err := json.Marshal(releases.Data)
+	if err != nil {
+		fmt.Printf("Failed to marshal releases data: %v\n", err)
+		return
+	}
+
+	var releaseList []Release
+	if err := json.Unmarshal(dataBytes, &releaseList); err != nil {
+		fmt.Printf("Failed to unmarshal releases data: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Fetched %d releases from manager:\n", len(releaseList))
+	releasesToDo := []Release{}
+	for _, release := range releaseList {
+		if release.Status == "completed" {
+			fmt.Printf("  - Project: %s, App: %s, Version: %s, Environment: %s, Status: %s\n",
+				release.ProjectName, release.ApplicationID, release.Version, release.Environment, release.Status)
+			releasesToDo = append(releasesToDo, release)
+		}
+	}
+	//TODO:// diff to refresh releasesToDo
+	rp.config.releasesToDo = releasesToDo
+	fmt.Printf("%d Releases to do updated.\n", len(releasesToDo))
+	// 一旦有了新的 releasesToDo，就去获取对应的二进制文件信息
+	for _, release := range releasesToDo {
+		binInfo, err := rp.GetBinaryInfo(release.ApplicationID)
+		if err != nil {
+			fmt.Printf("Failed to get binary info for %s: %v\n", release.ApplicationID, err)
 			continue
 		}
-		// 调用 CheckNodeStatus 方法
-		err = rp.CheckNodeStatus()
-		if err != nil {
-			fmt.Printf("Node status check failed: %v\n", err)
-			// 如果节点状态检查失败，则调用 RegisterNode 方法注册节点
-			err = rp.RegisterNode()
-			if err != nil {
-				fmt.Printf("Node registration failed: %v\n", err)
-			}
-		}
+		fmt.Printf("Binary info for %s: %s\n", release.ApplicationID, string(binInfo))
 	}
 }
