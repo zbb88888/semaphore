@@ -28,9 +28,12 @@ import (
 
 // ProxyConfig holds configuration for the runner proxy
 type ProxyConfig struct {
+	// NeedRegister      bool
+
 	ManagerURL        string
 	ManagerIsActive   bool
 	NodeName          string
+	RunnerID          string
 	BinProxyVersion   string
 	KeepAliveInterval time.Duration
 	HTTPClient        *http.Client
@@ -57,6 +60,7 @@ type KeepAliveRequest struct {
 	CPUArch         string `json:"cpu_arch"`
 	OSRelease       string `json:"os_release"`
 	NodeName        string `json:"node_name"`
+	NodeID          string `json:"node_id"` // 这个应该为 runner id，每个集群就是一个 runner
 	BinProxyVersion string `json:"bin_proxy_version"`
 }
 
@@ -76,7 +80,7 @@ type ProgressRequest struct {
 
 // CheckNodeStatus queries node status via GET /api/v1/keepalive
 func (rp *RunnerProxy) CheckNodeStatus() error {
-	url := fmt.Sprintf("%s/api/v1/keepalive?node_id=%s", rp.config.ManagerURL, rp.config.NodeName)
+	url := fmt.Sprintf("%s/api/v1/keepalive?node_id=%s", rp.config.ManagerURL, rp.config.RunnerID)
 	resp, err := rp.config.HTTPClient.Get(url)
 	if err != nil {
 		return fmt.Errorf("failed to check node status: %w", err)
@@ -86,13 +90,14 @@ func (rp *RunnerProxy) CheckNodeStatus() error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("node status check failed with status: %d", resp.StatusCode)
 	}
-
 	return nil
 }
 
 // RegisterNode registers the node via POST /api/v1/keepalive
 func (rp *RunnerProxy) RegisterNode() error {
+	NodeID := rp.config.RunnerID
 	request := KeepAliveRequest{
+		NodeID:          NodeID,
 		NodeName:        rp.config.NodeName,
 		CPUArch:         runtime.GOARCH,
 		OSRelease:       runtime.GOOS,
@@ -245,23 +250,40 @@ func NewProxyService() *RunnerProxy {
 		ManagerURL:        "http://localhost:38012", // Default manager URL
 		NodeName:          nodeName,                 // Auto-detected node name
 		BinProxyVersion:   "1.0.0",                  // Default version
-		KeepAliveInterval: 30 * time.Second,         // Default interval
+		KeepAliveInterval: 10 * time.Second,         // Default interval
 		HTTPClient:        &http.Client{Timeout: 30 * time.Second},
+		RunnerID:          "manage-gen-runner-id-001",
 	}
 	return NewRunnerProxy(config)
 }
 
 // 实现一个 run 函数
-// 1. 每隔 KeepAliveInterval 调用 HealthCheck 方法
 func (rp *RunnerProxy) Run() {
 	fmt.Printf("Runner Proxy started. Manager URL: %s, Node: %s\n", rp.config.ManagerURL, rp.config.NodeName)
 	ticker := time.NewTicker(rp.config.KeepAliveInterval)
 	defer ticker.Stop()
 
 	for range ticker.C {
+		// 每隔 KeepAliveInterval 调用 HealthCheck 方法
 		err := rp.HealthCheck()
 		if err != nil {
 			fmt.Printf("Health check failed: %v\n", err)
+		}
+		if !rp.config.ManagerIsActive {
+			fmt.Println("Manager is not active. Skipping further checks.")
+			continue
+		}
+		// 调用 CheckNodeStatus 方法
+		err = rp.CheckNodeStatus()
+		if err != nil {
+			fmt.Printf("Node status check failed: %v\n", err)
+			// 如果节点状态检查失败，则调用 RegisterNode 方法注册节点
+			err = rp.RegisterNode()
+			if err != nil {
+				fmt.Printf("Node registration failed: %v\n", err)
+			}
+		} else {
+			fmt.Println("Node status is healthy")
 		}
 	}
 }
