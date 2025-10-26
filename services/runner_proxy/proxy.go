@@ -30,13 +30,14 @@ import (
 type ProxyConfig struct {
 	// NeedRegister      bool
 
-	ManagerURL        string
-	ManagerIsActive   bool
-	NodeName          string
-	RunnerID          string
-	BinProxyVersion   string
+	ManagerURL      string
+	ManagerIsActive bool
+	NodeName        string
+	RunnerID        string
+	BinProxyVersion string
+	HTTPClient      *http.Client
+
 	KeepAliveInterval time.Duration
-	HTTPClient        *http.Client
 }
 
 // RunnerProxy manages communication with the manager
@@ -260,10 +261,12 @@ func NewProxyService() *RunnerProxy {
 // 实现一个 run 函数
 func (rp *RunnerProxy) Run() {
 	fmt.Printf("Runner Proxy started. Manager URL: %s, Node: %s\n", rp.config.ManagerURL, rp.config.NodeName)
-	ticker := time.NewTicker(rp.config.KeepAliveInterval)
-	defer ticker.Stop()
 
-	for range ticker.C {
+	// todo:// 创建两个定时器：一个用于 keepalive，一个用于拉取 releases
+	keepaliveTicker := time.NewTicker(rp.config.KeepAliveInterval)
+	defer keepaliveTicker.Stop()
+
+	for range keepaliveTicker.C {
 		// 每隔 KeepAliveInterval 调用 HealthCheck 方法
 		err := rp.HealthCheck()
 		if err != nil {
@@ -282,8 +285,6 @@ func (rp *RunnerProxy) Run() {
 			if err != nil {
 				fmt.Printf("Node registration failed: %v\n", err)
 			}
-		} else {
-			fmt.Println("Node status is healthy")
 		}
 	}
 }
