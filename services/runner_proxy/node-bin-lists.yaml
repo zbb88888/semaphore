@@ -1,0 +1,5 @@
+bins:
+  - runner-proxy # TODO:// 支持自升级
+  - streamd
+# 静态文件维护太僵硬了，放弃
+# 从 release 接口中拿到当前在集群应该运行的服务（bin）列表
