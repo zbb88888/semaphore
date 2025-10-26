@@ -40,7 +40,7 @@ type ProxyConfig struct {
 
 	KeepAliveInterval time.Duration
 	// 待部署的服务列表：包含 bin 服务类型
-	releasesToDo []Release
+	ReleasesToDo []Release
 }
 
 // RunnerProxy manages communication with the manager
@@ -387,21 +387,21 @@ func (rp *RunnerProxy) fetchAndLogReleases() {
 	}
 
 	fmt.Printf("Fetched %d releases from manager:\n", len(releaseList))
-	releasesToDo := []Release{}
+	ReleasesToDo := []Release{}
 	for _, release := range releaseList {
 		if release.Status == "completed" && release.TarFileName != "" {
 			// applicationId version environment strategy tarFileName
 			fmt.Printf("  - Project: %s, App: %s, Version: %s, Environment: %s, Strategy: %s, TarFile: %s\n",
 				release.ProjectName, release.ApplicationID, release.Version,
 				release.Environment, release.Strategy, release.TarFileName)
-			releasesToDo = append(releasesToDo, release)
+			ReleasesToDo = append(ReleasesToDo, release)
 		}
 	}
-	//TODO:// diff to refresh releasesToDo
-	rp.config.releasesToDo = releasesToDo
-	fmt.Printf("%d Releases to do updated.\n", len(releasesToDo))
-	// 一旦有了新的 releasesToDo，就去获取对应的二进制文件信息
-	for _, release := range releasesToDo {
+	//TODO:// diff to refresh ReleasesToDo
+	rp.config.ReleasesToDo = ReleasesToDo
+	fmt.Printf("%d Releases to do updated.\n", len(ReleasesToDo))
+	// 一旦有了新的 ReleasesToDo，就去获取对应的二进制文件信息
+	for _, release := range ReleasesToDo {
 		binInfo, err := rp.GetBinaryInfo(release.ApplicationID)
 		if err != nil {
 			fmt.Printf("Failed to get binary info for %s: %v\n", release.ApplicationID, err)
