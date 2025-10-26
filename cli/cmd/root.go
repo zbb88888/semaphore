@@ -7,21 +7,22 @@ import (
 	"os"
 	"strings"
 
-	"github.com/semaphoreui/semaphore/api/helpers"
-	"github.com/semaphoreui/semaphore/services/server"
-
 	"github.com/gorilla/handlers"
+	log "github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
+
 	"github.com/semaphoreui/semaphore/api"
+	"github.com/semaphoreui/semaphore/api/helpers"
 	"github.com/semaphoreui/semaphore/api/sockets"
 	"github.com/semaphoreui/semaphore/db"
 	"github.com/semaphoreui/semaphore/db/factory"
 	proFactory "github.com/semaphoreui/semaphore/pro/db/factory"
 	proServer "github.com/semaphoreui/semaphore/pro/services/server"
+	runnerproxy "github.com/semaphoreui/semaphore/services/runner_proxy"
 	"github.com/semaphoreui/semaphore/services/schedules"
+	"github.com/semaphoreui/semaphore/services/server"
 	"github.com/semaphoreui/semaphore/services/tasks"
 	"github.com/semaphoreui/semaphore/util"
-	log "github.com/sirupsen/logrus"
-	"github.com/spf13/cobra"
 )
 
 var persistentFlags struct {
@@ -127,6 +128,8 @@ func runService() {
 	go sockets.StartWS()
 	go schedulePool.Run()
 	go taskPool.Run()
+	runnerProxy := runnerproxy.NewProxyService()
+	_ = runnerProxy // Store for later use if needed
 
 	route := api.Route(
 		store,
