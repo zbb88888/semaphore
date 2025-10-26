@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"runtime"
 	"time"
 )
@@ -28,7 +29,7 @@ import (
 // ProxyConfig holds configuration for the runner proxy
 type ProxyConfig struct {
 	ManagerURL        string
-	NodeID            string
+	ManagerIsActive   bool
 	NodeName          string
 	BinProxyVersion   string
 	KeepAliveInterval time.Duration
@@ -53,7 +54,6 @@ func NewRunnerProxy(config *ProxyConfig) *RunnerProxy {
 
 // KeepAliveRequest represents the request body for node registration
 type KeepAliveRequest struct {
-	NodeID          string `json:"node_id"`
 	CPUArch         string `json:"cpu_arch"`
 	OSRelease       string `json:"os_release"`
 	NodeName        string `json:"node_name"`
@@ -62,7 +62,7 @@ type KeepAliveRequest struct {
 
 // BinaryUpdateRequest represents the request body for binary version updates
 type BinaryUpdateRequest struct {
-	NodeID    string `json:"node_id"`
+	NodeName  string `json:"node_id"`
 	SHA256Sum string `json:"sha256sum"`
 }
 
@@ -76,7 +76,7 @@ type ProgressRequest struct {
 
 // CheckNodeStatus queries node status via GET /api/v1/keepalive
 func (rp *RunnerProxy) CheckNodeStatus() error {
-	url := fmt.Sprintf("%s/api/v1/keepalive?node_id=%s", rp.config.ManagerURL, rp.config.NodeID)
+	url := fmt.Sprintf("%s/api/v1/keepalive?node_id=%s", rp.config.ManagerURL, rp.config.NodeName)
 	resp, err := rp.config.HTTPClient.Get(url)
 	if err != nil {
 		return fmt.Errorf("failed to check node status: %w", err)
@@ -93,10 +93,9 @@ func (rp *RunnerProxy) CheckNodeStatus() error {
 // RegisterNode registers the node via POST /api/v1/keepalive
 func (rp *RunnerProxy) RegisterNode() error {
 	request := KeepAliveRequest{
-		NodeID:          rp.config.NodeID,
+		NodeName:        rp.config.NodeName,
 		CPUArch:         runtime.GOARCH,
 		OSRelease:       runtime.GOOS,
-		NodeName:        rp.config.NodeName,
 		BinProxyVersion: rp.config.BinProxyVersion,
 	}
 
@@ -143,7 +142,7 @@ func (rp *RunnerProxy) GetBinaryInfo(binName string) ([]byte, error) {
 // UpdateBinaryVersion updates node's binary file version via POST /api/v1/bins/:bin_name
 func (rp *RunnerProxy) UpdateBinaryVersion(binName, sha256sum string) error {
 	request := BinaryUpdateRequest{
-		NodeID:    rp.config.NodeID,
+		NodeName:  rp.config.NodeName,
 		SHA256Sum: sha256sum,
 	}
 
@@ -225,9 +224,11 @@ func (rp *RunnerProxy) HealthCheck() error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		rp.config.ManagerIsActive = false
 		return fmt.Errorf("health check failed with status: %d", resp.StatusCode)
 	}
 
+	rp.config.ManagerIsActive = true
 	return nil
 }
 
@@ -235,13 +236,32 @@ func (rp *RunnerProxy) HealthCheck() error {
 // This is a convenience function for simple setups
 // The RunnerProxy is just an HTTP client to interact with manager API server
 func NewProxyService() *RunnerProxy {
+	// 获取 linux 操作系统的名字
+	nodeName, err := os.Hostname()
+	if err != nil {
+		panic(fmt.Errorf("failed to get hostname: %w", err))
+	}
 	config := &ProxyConfig{
-		ManagerURL:        "http://localhost:3000", // Default manager URL
-		NodeID:            "default-node",          // Default node ID
-		NodeName:          "semaphore-node",        // Default node name
-		BinProxyVersion:   "1.0.0",                 // Default version
-		KeepAliveInterval: 30 * time.Second,        // Default interval
+		ManagerURL:        "http://localhost:38012", // Default manager URL
+		NodeName:          nodeName,                 // Auto-detected node name
+		BinProxyVersion:   "1.0.0",                  // Default version
+		KeepAliveInterval: 30 * time.Second,         // Default interval
 		HTTPClient:        &http.Client{Timeout: 30 * time.Second},
 	}
 	return NewRunnerProxy(config)
+}
+
+// 实现一个 run 函数
+// 1. 每隔 KeepAliveInterval 调用 HealthCheck 方法
+func (rp *RunnerProxy) Run() {
+	fmt.Printf("Runner Proxy started. Manager URL: %s, Node: %s\n", rp.config.ManagerURL, rp.config.NodeName)
+	ticker := time.NewTicker(rp.config.KeepAliveInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		err := rp.HealthCheck()
+		if err != nil {
+			fmt.Printf("Health check failed: %v\n", err)
+		}
+	}
 }

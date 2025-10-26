@@ -129,7 +129,7 @@ func runService() {
 	go schedulePool.Run()
 	go taskPool.Run()
 	runnerProxy := runnerproxy.NewProxyService()
-	_ = runnerProxy // Store for later use if needed
+	go runnerProxy.Run()
 
 	route := api.Route(
 		store,
