@@ -2,7 +2,30 @@
 
 本实现为 RunnerProxy 添加了将 bin 对应到 runner 的功能，支持在 runner 中创建 template 和 task。
 
-## 功能概述
+## 架构概述
+
+```
+外部 Manager API --> RunnerProxy (HTTP Client) --> Semaphore API
+```
+
+- **外部 Manager API**: 提供 releases 接口 (`ManagerURL`)
+- **RunnerProxy**: HTTP 客户端，负责 bin 到 runner 的映射
+- **Semaphore API**: 现有的成熟 API，用于创建 templates 和 tasks (`SemaphoreURL`)
+
+**重要**: RunnerProxy **不修改** Semaphore 的 router.go，而是通过 HTTP 客户端调用现有的 API。
+
+## 配置说明
+
+```go
+type ProxyConfig struct {
+    ManagerURL      string // 外部 manager API URL (用于获取 releases)
+    SemaphoreURL    string // Semaphore API URL (用于创建 templates 和 tasks)
+    NodeName        string
+    RunnerID        string
+    BinProxyVersion string
+    HTTPClient      *http.Client
+}
+```
 
 ### 1. Bin 到 Runner 的映射
 

@@ -25,13 +25,16 @@ import (
 	"os"
 	"runtime"
 	"time"
+
+	"github.com/semaphoreui/semaphore/db"
 )
 
 // ProxyConfig holds configuration for the runner proxy
 type ProxyConfig struct {
 	// NeedRegister      bool
 
-	ManagerURL      string
+	ManagerURL      string // 外部 manager API URL
+	SemaphoreURL    string // Semaphore API URL (用于创建 templates 和 tasks)
 	ManagerIsActive bool
 	NodeName        string
 	RunnerID        string
@@ -41,6 +44,12 @@ type ProxyConfig struct {
 	KeepAliveInterval time.Duration
 	// 待部署的服务列表：包含 bin 服务类型
 	ReleasesToDo []Release
+
+	// 把 release 里的 bin 名字和 version 提取出来
+	BinsToDo map[string]string
+
+	// 每一个 bin 都对应一个 Runner: 对应到 semaphore template，然后基于 template 创建 semaphore task，最后 把 version 变量传给 task 并启动
+	Runners map[string]*Runner
 }
 
 // RunnerProxy manages communication with the manager
@@ -303,6 +312,7 @@ func NewProxyService() *RunnerProxy {
 	}
 	config := &ProxyConfig{
 		ManagerURL:        "http://localhost:38012", // Default manager URL
+		SemaphoreURL:      "http://localhost:3000",  // Default Semaphore URL
 		NodeName:          nodeName,                 // Auto-detected node name
 		BinProxyVersion:   "1.0.0",                  // Default version
 		KeepAliveInterval: 10 * time.Second,         // Default interval
@@ -400,13 +410,284 @@ func (rp *RunnerProxy) fetchAndLogReleases() {
 	//TODO:// diff to refresh ReleasesToDo
 	rp.config.ReleasesToDo = ReleasesToDo
 	fmt.Printf("%d Releases to do updated.\n", len(ReleasesToDo))
-	// 一旦有了新的 ReleasesToDo，就去获取对应的二进制文件信息
+	binsToDo := make(map[string]string)
+	// 把 release 里的 bin 名字和 version 提取出来
 	for _, release := range ReleasesToDo {
-		binInfo, err := rp.GetBinaryInfo(release.ApplicationID)
+		binsToDo[release.ApplicationID] = release.Version
+	}
+	rp.config.BinsToDo = binsToDo
+	// 调用 runner.template.Search 函数 找到 bin 对应的 semaphore 的 ansible-playbook 任务模板
+	for bin, version := range binsToDo {
+		// 为每个 bin 创建或更新对应的 Runner
+		err := rp.createOrUpdateRunner(bin, version, ReleasesToDo)
 		if err != nil {
-			fmt.Printf("Failed to get binary info for %s: %v\n", release.ApplicationID, err)
+			fmt.Printf("Failed to create/update runner for bin %s: %v\n", bin, err)
 			continue
 		}
-		fmt.Printf("Binary info for %s: %s\n", release.ApplicationID, string(binInfo))
+		fmt.Printf("Successfully created/updated runner for bin %s version %s\n", bin, version)
 	}
+
+}
+
+// createOrUpdateRunner 为指定的 bin 创建或更新 Runner
+func (rp *RunnerProxy) createOrUpdateRunner(bin, version string, releases []Release) error {
+	// 从 releases 中找到对应的 release 信息
+	var targetRelease *Release
+	for _, release := range releases {
+		if release.ApplicationID == bin {
+			targetRelease = &release
+			break
+		}
+	}
+
+	if targetRelease == nil {
+		return fmt.Errorf("no release found for bin: %s", bin)
+	}
+
+	// 初始化 Runners map 如果为空
+	if rp.config.Runners == nil {
+		rp.config.Runners = make(map[string]*Runner)
+	}
+
+	// 检查是否已存在该 bin 的 runner
+	runner, exists := rp.config.Runners[bin]
+	if !exists {
+		// 创建新的 runner
+		runner = &Runner{
+			AppName:     bin,
+			Environment: targetRelease.Environment,
+			Strategy:    targetRelease.Strategy,
+			Version:     version,
+			GitLink:     targetRelease.GitlabPRURL, // 使用 GitlabPRURL 作为 GitLink
+		}
+		rp.config.Runners[bin] = runner
+		fmt.Printf("Created new runner for bin: %s\n", bin)
+	} else {
+		// 更新现有 runner 的版本信息
+		runner.Version = version
+		runner.Environment = targetRelease.Environment
+		runner.Strategy = targetRelease.Strategy
+		fmt.Printf("Updated existing runner for bin: %s\n", bin)
+	}
+
+	// 为 runner 创建 templates 和 tasks
+	err := rp.setupRunnerTemplatesAndTasks(runner, targetRelease)
+	if err != nil {
+		return fmt.Errorf("failed to setup templates and tasks for runner %s: %w", bin, err)
+	}
+
+	return nil
+}
+
+// setupRunnerTemplatesAndTasks 为 runner 设置 templates 和 tasks
+func (rp *RunnerProxy) setupRunnerTemplatesAndTasks(runner *Runner, release *Release) error {
+	// 解析 projectID
+	projectID := 1 // 默认项目ID，实际应该从配置或 release 中获取
+	if release.ProjectID != "" {
+		// 这里可以添加字符串到整数的转换逻辑
+		// 为简化，暂时使用默认值
+	}
+
+	runner.projectID = projectID
+
+	// 创建四个部署阶段的 templates
+	err := rp.createDeploymentTemplates(runner, projectID)
+	if err != nil {
+		return fmt.Errorf("failed to create deployment templates: %w", err)
+	}
+
+	// 基于 templates 创建对应的 tasks
+	err = rp.createDeploymentTasks(runner, projectID)
+	if err != nil {
+		return fmt.Errorf("failed to create deployment tasks: %w", err)
+	}
+
+	return nil
+}
+
+// createDeploymentTemplates 创建四个部署阶段的 templates
+func (rp *RunnerProxy) createDeploymentTemplates(runner *Runner, projectID int) error {
+	// 创建 pre_download template
+	preDownloadTemplate, err := rp.createTemplate(projectID, runner, "pre_download")
+	if err != nil {
+		return fmt.Errorf("failed to create pre_download template: %w", err)
+	}
+	runner.preDownloadTemplateID = preDownloadTemplate.ID
+
+	// 创建 deploy template
+	deployTemplate, err := rp.createTemplate(projectID, runner, "deploy")
+	if err != nil {
+		return fmt.Errorf("failed to create deploy template: %w", err)
+	}
+	runner.deployTemplateID = deployTemplate.ID
+
+	// 创建 post_check template
+	postCheckTemplate, err := rp.createTemplate(projectID, runner, "post_check")
+	if err != nil {
+		return fmt.Errorf("failed to create post_check template: %w", err)
+	}
+	runner.postCheckTemplateID = postCheckTemplate.ID
+
+	// 创建 roll_back template
+	rollBackTemplate, err := rp.createTemplate(projectID, runner, "roll_back")
+	if err != nil {
+		return fmt.Errorf("failed to create roll_back template: %w", err)
+	}
+	runner.rollBackTemplateID = rollBackTemplate.ID
+
+	fmt.Printf("Created all deployment templates for runner %s\n", runner.AppName)
+	return nil
+}
+
+// createTemplate 创建指定阶段的 template
+func (rp *RunnerProxy) createTemplate(projectID int, runner *Runner, stage string) (*db.Template, error) {
+	// 需要导入 db 包
+	template := db.Template{
+		Name:         fmt.Sprintf("%s-%s-%s", runner.AppName, stage, runner.Environment),
+		ProjectID:    projectID,
+		Playbook:     fmt.Sprintf("deploy/%s.yml", stage),
+		Arguments:    &[]string{fmt.Sprintf("--extra-vars version=%s environment=%s strategy=%s", runner.Version, runner.Environment, runner.Strategy)}[0],
+		Description:  &[]string{fmt.Sprintf("Deployment template for %s %s stage", runner.AppName, stage)}[0],
+		App:          db.AppAnsible,
+		RepositoryID: 1, // 默认仓库ID，实际应该从配置中获取
+		// 设置其他必要的字段
+		TaskParams: map[string]interface{}{
+			"version":     runner.Version,
+			"environment": runner.Environment,
+			"strategy":    runner.Strategy,
+			"app_name":    runner.AppName,
+		},
+	}
+
+	createdTemplate, err := rp.CreateTemplate(projectID, template)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create template for stage %s: %w", stage, err)
+	}
+
+	fmt.Printf("Created template %s (ID: %d) for runner %s\n", createdTemplate.Name, createdTemplate.ID, runner.AppName)
+	return createdTemplate, nil
+}
+
+// createDeploymentTasks 创建四个部署阶段的 tasks
+func (rp *RunnerProxy) createDeploymentTasks(runner *Runner, projectID int) error {
+	// 创建 pre_download task
+	preDownloadTask, err := rp.createTask(projectID, runner.preDownloadTemplateID, runner, "pre_download")
+	if err != nil {
+		return fmt.Errorf("failed to create pre_download task: %w", err)
+	}
+	runner.preDownloadTaskID = preDownloadTask.ID
+
+	// 创建 deploy task
+	deployTask, err := rp.createTask(projectID, runner.deployTemplateID, runner, "deploy")
+	if err != nil {
+		return fmt.Errorf("failed to create deploy task: %w", err)
+	}
+	runner.deployTaskID = deployTask.ID
+
+	// 创建 post_check task
+	postCheckTask, err := rp.createTask(projectID, runner.postCheckTemplateID, runner, "post_check")
+	if err != nil {
+		return fmt.Errorf("failed to create post_check task: %w", err)
+	}
+	runner.postCheckTaskID = postCheckTask.ID
+
+	// 创建 roll_back task
+	rollBackTask, err := rp.createTask(projectID, runner.rollBackTemplateID, runner, "roll_back")
+	if err != nil {
+		return fmt.Errorf("failed to create roll_back task: %w", err)
+	}
+	runner.rollBackTaskID = rollBackTask.ID
+
+	fmt.Printf("Created all deployment tasks for runner %s\n", runner.AppName)
+	return nil
+}
+
+// createTask 创建指定阶段的 task
+func (rp *RunnerProxy) createTask(projectID, templateID int, runner *Runner, stage string) (*db.Task, error) {
+	task := db.Task{
+		ProjectID:   projectID,
+		TemplateID:  templateID,
+		Playbook:    fmt.Sprintf("deploy/%s.yml", stage),
+		Arguments:   &[]string{fmt.Sprintf("--extra-vars version=%s environment=%s strategy=%s app_name=%s", runner.Version, runner.Environment, runner.Strategy, runner.AppName)}[0],
+		Environment: fmt.Sprintf("%s-%s", runner.AppName, runner.Environment),
+		Message:     fmt.Sprintf("Deploy %s %s in %s environment using %s strategy", runner.AppName, runner.Version, runner.Environment, runner.Strategy),
+		Params: map[string]interface{}{
+			"version":     runner.Version,
+			"environment": runner.Environment,
+			"strategy":    runner.Strategy,
+			"app_name":    runner.AppName,
+			"stage":       stage,
+		},
+	}
+
+	createdTask, err := rp.CreateTask(projectID, templateID, task)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create task for stage %s: %w", stage, err)
+	}
+
+	fmt.Printf("Created task %s (ID: %d) for runner %s\n", stage, createdTask.ID, runner.AppName)
+	return createdTask, nil
+}
+
+// StartDeploymentForBin 为指定的 bin 启动部署流程
+func (rp *RunnerProxy) StartDeploymentForBin(binName string) error {
+	if rp.config.Runners == nil {
+		return fmt.Errorf("no runners configured")
+	}
+
+	runner, exists := rp.config.Runners[binName]
+	if !exists {
+		return fmt.Errorf("no runner found for bin: %s", binName)
+	}
+
+	return runner.StartDeployment(rp)
+}
+
+// StartRollbackForBin 为指定的 bin 启动回滚操作
+func (rp *RunnerProxy) StartRollbackForBin(binName string) error {
+	if rp.config.Runners == nil {
+		return fmt.Errorf("no runners configured")
+	}
+
+	runner, exists := rp.config.Runners[binName]
+	if !exists {
+		return fmt.Errorf("no runner found for bin: %s", binName)
+	}
+
+	return runner.StartRollback(rp)
+}
+
+// GetRunnerStatus 获取指定 bin 的 runner 状态
+func (rp *RunnerProxy) GetRunnerStatus(binName string) (map[string]interface{}, error) {
+	if rp.config.Runners == nil {
+		return nil, fmt.Errorf("no runners configured")
+	}
+
+	runner, exists := rp.config.Runners[binName]
+	if !exists {
+		return nil, fmt.Errorf("no runner found for bin: %s", binName)
+	}
+
+	return runner.GetStatus(rp)
+}
+
+// GetAllRunnerStatuses 获取所有 runners 的状态
+func (rp *RunnerProxy) GetAllRunnerStatuses() (map[string]interface{}, error) {
+	if rp.config.Runners == nil {
+		return map[string]interface{}{}, nil
+	}
+
+	statuses := make(map[string]interface{})
+	for binName, runner := range rp.config.Runners {
+		status, err := runner.GetStatus(rp)
+		if err != nil {
+			statuses[binName] = map[string]interface{}{
+				"error": err.Error(),
+			}
+		} else {
+			statuses[binName] = status
+		}
+	}
+
+	return statuses, nil
 }
