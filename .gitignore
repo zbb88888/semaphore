@@ -52,3 +52,4 @@ __debug_bin*
 *.json
 web/*.json
 web/package-lock.json
+/web/package-lock.json
