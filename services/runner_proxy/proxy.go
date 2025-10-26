@@ -318,7 +318,7 @@ func (rp *RunnerProxy) Run() {
 
 	// 创建两个定时器：一个用于 keepalive，一个用于拉取 releases
 	keepaliveTicker := time.NewTicker(rp.config.KeepAliveInterval)
-	releasesTicker := time.NewTicker(10 * time.Second) // 每10秒拉取一次 releases
+	releasesTicker := time.NewTicker(1 * time.Minute) // 每分钟拉取一次 releases
 	defer keepaliveTicker.Stop()
 	defer releasesTicker.Stop()
 
@@ -389,9 +389,11 @@ func (rp *RunnerProxy) fetchAndLogReleases() {
 	fmt.Printf("Fetched %d releases from manager:\n", len(releaseList))
 	releasesToDo := []Release{}
 	for _, release := range releaseList {
-		if release.Status == "completed" {
-			fmt.Printf("  - Project: %s, App: %s, Version: %s, Environment: %s, Status: %s\n",
-				release.ProjectName, release.ApplicationID, release.Version, release.Environment, release.Status)
+		if release.Status == "completed" && release.TarFileName != "" {
+			// applicationId version environment strategy tarFileName
+			fmt.Printf("  - Project: %s, App: %s, Version: %s, Environment: %s, Strategy: %s, TarFile: %s\n",
+				release.ProjectName, release.ApplicationID, release.Version,
+				release.Environment, release.Strategy, release.TarFileName)
 			releasesToDo = append(releasesToDo, release)
 		}
 	}
